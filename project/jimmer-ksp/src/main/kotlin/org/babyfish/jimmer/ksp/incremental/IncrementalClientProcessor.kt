@@ -1,40 +1,22 @@
 package org.babyfish.jimmer.ksp.incremental
 
-import com.google.devtools.ksp.getDeclaredFunctions
-import com.google.devtools.ksp.getDeclaredProperties
-import com.google.devtools.ksp.isPublic
+import com.google.devtools.ksp.*
 import com.google.devtools.ksp.processing.Dependencies
-import com.google.devtools.ksp.symbol.ClassKind
-import com.google.devtools.ksp.symbol.KSClassDeclaration
-import com.google.devtools.ksp.symbol.KSDeclaration
-import com.google.devtools.ksp.symbol.KSFile
-import com.google.devtools.ksp.symbol.KSType
-import com.google.devtools.ksp.symbol.KSTypeReference
-import com.google.devtools.ksp.symbol.KSTypeAlias
-import com.google.devtools.ksp.symbol.Modifier
-import com.google.devtools.ksp.symbol.Variance
+import com.google.devtools.ksp.symbol.*
 import com.squareup.kotlinpoet.ksp.toTypeName
+import org.babyfish.jimmer.ClientException
+import org.babyfish.jimmer.Immutable
 import org.babyfish.jimmer.client.Api
 import org.babyfish.jimmer.client.ApiIgnore
 import org.babyfish.jimmer.client.FetchBy
-import org.babyfish.jimmer.client.meta.Annotation
-import org.babyfish.jimmer.client.meta.ApiOperation
-import org.babyfish.jimmer.client.meta.TypeDefinition
-import org.babyfish.jimmer.client.meta.TypeName
-import org.babyfish.jimmer.client.meta.impl.ApiOperationImpl
-import org.babyfish.jimmer.client.meta.impl.ApiParameterImpl
-import org.babyfish.jimmer.client.meta.impl.ApiServiceImpl
-import org.babyfish.jimmer.client.meta.impl.SchemaBuilder
-import org.babyfish.jimmer.client.meta.impl.SchemaImpl
-import org.babyfish.jimmer.client.meta.impl.TypeDefinitionImpl
-import org.babyfish.jimmer.client.meta.impl.TypeRefImpl
+import org.babyfish.jimmer.client.meta.*
+import org.babyfish.jimmer.client.meta.impl.*
+import org.babyfish.jimmer.error.CodeBasedException
+import org.babyfish.jimmer.error.CodeBasedRuntimeException
 import org.babyfish.jimmer.impl.util.StringUtil
-import org.babyfish.jimmer.ksp.Context
-import org.babyfish.jimmer.ksp.MetaException
-import org.babyfish.jimmer.ksp.annotation
-import org.babyfish.jimmer.ksp.client.ClientExceptionMetadata
+import org.babyfish.jimmer.ksp.*
+import org.babyfish.jimmer.ksp.client.ClientExceptionContext
 import org.babyfish.jimmer.ksp.client.DocMetadata
-import org.babyfish.jimmer.ksp.fullName
 import org.babyfish.jimmer.ksp.util.fastResolve
 import org.babyfish.jimmer.sql.Embeddable
 import org.babyfish.jimmer.sql.Entity
@@ -47,52 +29,52 @@ class IncrementalClientProcessor(
     private val state: ProcessorState
 ) {
     private val clientExceptionContext = ClientExceptionContext()
+
     private val docMetadata = DocMetadata(ctx)
+
     private val jsonValueTypeNameStack = mutableSetOf<TypeName>()
-    
+
     private var previousSchemaHash: Long = 0
     private var currentSchemaHash: Long = 0
-    
+
     fun shouldProcess(): Boolean {
         previousSchemaHash = state.getSchemaHash()
-        
         val newDeclarations = findNewOrModifiedDeclarations()
         if (newDeclarations.isEmpty()) {
             return false
         }
-        
         return true
     }
-    
+
     fun process(explicitClientApi: Boolean) {
         val allDeclarations = findAllApiDeclarations(explicitClientApi)
         currentSchemaHash = computeSchemaHash(allDeclarations)
-        
+
         if (currentSchemaHash == previousSchemaHash && previousSchemaHash != 0L) {
             ctx.environment.logger.info("Client schema unchanged, skipping generation")
             return
         }
-        
-        generateClientSchema(allDeclarations)
+
+        generateClientSchema(allDeclarations, explicitClientApi)
         state.setSchemaHash(currentSchemaHash)
     }
-    
+
     private fun findNewOrModifiedDeclarations(): List<KSClassDeclaration> {
         val newFiles = ctx.resolver.getNewFiles().toList()
         if (newFiles.isEmpty()) return emptyList()
-        
+
         return newFiles.flatMap { file ->
             file.declarations.filterIsInstance<KSClassDeclaration>()
         }
     }
-    
+
     private fun findAllApiDeclarations(explicitClientApi: Boolean): List<KSClassDeclaration> {
         return ctx.resolver.getAllFiles().flatMap { file ->
             file.declarations.filterIsInstance<KSClassDeclaration>()
                 .filter { isApiService(it, explicitClientApi) }
         }
     }
-    
+
     private fun computeSchemaHash(declarations: List<KSClassDeclaration>): Long {
         val sb = StringBuilder()
         for (decl in declarations.sortedBy { it.qualifiedName?.asString() }) {
@@ -106,29 +88,34 @@ class IncrementalClientProcessor(
         }
         return sb.toString().hashCode().toLong()
     }
-    
-    private fun generateClientSchema(declarations: List<KSClassDeclaration>) {
+
+    private fun generateClientSchema(declarations: List<KSClassDeclaration>, explicitClientApi: Boolean) {
         val builder = object : SchemaBuilder<KSDeclaration>(null) {
             override fun loadSource(typeName: String): KSClassDeclaration? =
                 ctx.resolver.getClassDeclarationByName(typeName)
-            
+
             override fun throwException(source: KSDeclaration, message: String) {
-                throw MetaException(source as? KSClassDeclaration, null, message)
+                throw MetaException(source, null, message)
             }
-            
+
             override fun fillDefinition(source: KSDeclaration?) {
-                if (source is KSClassDeclaration) {
-                    fillDefinitionInternal(source)
-                }
+                val declaration = source as KSClassDeclaration
+                fillDefinition(
+                    declaration,
+                    declaration.annotation(Immutable::class) !== null ||
+                        declaration.annotation(Entity::class) !== null ||
+                        declaration.annotation(MappedSuperclass::class) !== null ||
+                        declaration.annotation(Embeddable::class) !== null
+                )
             }
         }
-        
+
         for (declaration in declarations) {
-            builder.handleService(declaration)
+            builder.handleService(declaration, explicitClientApi)
         }
-        
+
         val schema = builder.build()
-        
+
         val sourceFiles = declarations.mapNotNull { it.containingFile }.distinct().toTypedArray()
         ctx.environment.codeGenerator.createNewFile(
             Dependencies(false, *sourceFiles),
@@ -139,57 +126,74 @@ class IncrementalClientProcessor(
             Schemas.writeTo(schema, OutputStreamWriter(output, StandardCharsets.UTF_8))
         }
     }
-    
-    private fun SchemaBuilder<KSDeclaration>.handleService(declaration: KSClassDeclaration) {
-        if (!isApiService(declaration, true)) return
-        
+
+    private fun SchemaBuilder<KSDeclaration>.handleService(declaration: KSDeclaration, explicitClientApi: Boolean) {
+        if (declaration !is KSClassDeclaration || !isApiService(declaration, explicitClientApi)) {
+            return
+        }
         if (declaration.modifiers.contains(Modifier.INNER)) {
-            throw MetaException(declaration, null, "Client API service type cannot be inner type")
+            throw MetaException(
+                declaration,
+                null,
+                "Client API service type cannot be inner type"
+            )
         }
-        
         if (declaration.typeParameters.isNotEmpty()) {
-            throw MetaException(declaration.typeParameters[0], null, "Client API service cannot declare type parameters")
+            throw MetaException(
+                declaration.typeParameters[0],
+                null,
+                "Client API service cannot declare type parameters"
+            )
         }
-        
         val schema = current<SchemaImpl<KSDeclaration>>()
         api(declaration, declaration.toTypeName()) { service ->
-            declaration.annotation(Api::class)?.get<List<String>>("value")?.takeIf { it.isNotEmpty() }?.let { groups ->
+            declaration.annotation(Api::class)?.get<List<String>>("value")?.takeIf { it.isNotEmpty() }.let { groups ->
                 service.groups = groups
             }
             service.doc = docMetadata.getDoc(declaration)
-            
             for (func in declaration.getDeclaredFunctions()) {
-                if (isApiOperation(func)) {
+                if (isApiOperation(func, explicitClientApi)) {
                     handleOperation(func)
                 }
             }
             schema.addApiService(service)
         }
     }
-    
-    private fun SchemaBuilder<KSDeclaration>.handleOperation(func: com.google.devtools.ksp.symbol.KSFunctionDeclaration) {
+
+    private fun SchemaBuilder<KSDeclaration>.handleOperation(func: KSFunctionDeclaration) {
         val service = current<ApiServiceImpl<KSDeclaration>>()
-        
         if (func.typeParameters.isNotEmpty()) {
-            throw MetaException(func.typeParameters[0], null, "Client API function cannot declare type parameters")
+            throw MetaException(
+                func.typeParameters[0],
+                null,
+                "Client API function cannot declare type parameters"
+            )
         }
-        
         val api = func.annotation(Api::class)
         if (api == null && ApiOperation.AUTO_OPERATION_ANNOTATIONS.all { func.annotation(it) == null }) {
             return
         }
-        
         operation(func, func.simpleName.asString()) { operation ->
-            api?.get<List<String>>("value")?.takeIf { it.isNotEmpty() }?.let { groups ->
+            api?.get<List<String>>("value")?.takeIf { it.isNotEmpty() }?.let {
                 service.groups?.let { parentGroups ->
-                    val illegalGroups = parentGroups.toMutableSet().apply { removeAll(groups) }
+                    val illegalGroups = parentGroups.toMutableSet().apply {
+                        removeAll(it)
+                    }
                     if (illegalGroups.isNotEmpty()) {
-                        throw MetaException(operation.source, "Illegal groups: $illegalGroups")
+                        throw MetaException(
+                            operation.source,
+                            "It cannot be decorated by \"@" +
+                                Api::class.java +
+                                "\" with `groups` \"" +
+                                illegalGroups +
+                                "\" because they are not declared in declaring type \"" +
+                                service.typeName +
+                                "\""
+                        )
                     }
                 }
-                operation.groups = groups
+                operation.groups = it
             }
-            
             operation.doc = docMetadata.getDoc(func)
             var index = 0
             for (param in func.parameters) {
@@ -206,7 +210,6 @@ class IncrementalClientProcessor(
                     }
                 }
             }
-            
             func.returnType?.let { unresolvedType ->
                 val qualifiedName = unresolvedType.realDeclaration.qualifiedName?.asString()
                 if (qualifiedName != "kotlin.Unit" && qualifiedName != "kotlin.Nothing") {
@@ -216,10 +219,34 @@ class IncrementalClientProcessor(
                     }
                 }
             }
+            operation.setExceptionTypeNames(getExceptionTypeNames(func))
             service.addOperation(operation)
         }
     }
-    
+
+    private fun getExceptionTypeNames(func: KSFunctionDeclaration): Set<TypeName> {
+        val throws = func.annotation("kotlin.Throws")
+            ?: func.annotation("kotlin.jvm.Throws")
+            ?: return emptySet()
+        val declarations = throws.getClassListArgument(Throws::exceptionClasses)
+        val exceptionTypeNames = mutableSetOf<TypeName>()
+        for (declaration in declarations) {
+            if (declaration.annotation(ClientException::class) !== null) {
+                collectExceptionTypeNames(clientExceptionContext[declaration], exceptionTypeNames)
+            }
+        }
+        return exceptionTypeNames
+    }
+
+    private fun collectExceptionTypeNames(metadata: ClientExceptionMetadata, exceptionTypeNames: MutableSet<TypeName>) {
+        if (metadata.code != null) {
+            exceptionTypeNames += metadata.declaration.toTypeName()
+        }
+        for (subMetadata in metadata.subMetadatas) {
+            collectExceptionTypeNames(subMetadata, exceptionTypeNames)
+        }
+    }
+
     private fun SchemaBuilder<KSDeclaration>.fillType(type: KSTypeReference) {
         val typeRef = current<TypeRefImpl<KSDeclaration>>()
         try {
@@ -229,191 +256,492 @@ class IncrementalClientProcessor(
             determineTypeNameAndArguments(resolvedType)
             typeRef.removeOptional()
         } catch (ex: JsonValueTypeChangeException) {
-            typeRef.replaceBy(ex.typeRef, typeRef.isNullable || ex.typeRef.isNullable)
+            typeRef.replaceBy(
+                ex.typeRef,
+                typeRef.isNullable || ex.typeRef.isNullable
+            )
         }
     }
-    
+
     private fun SchemaBuilder<KSDeclaration>.determineNullity(type: KSType) {
         val typeRef = current<TypeRefImpl<KSDeclaration>>()
         typeRef.isNullable = type.isMarkedNullable
     }
-    
+
     private fun SchemaBuilder<KSDeclaration>.determineFetchBy(typeReference: KSTypeReference) {
-        // Simplified version - full implementation would be more complex
+        val typeRef = current<TypeRefImpl<KSDeclaration>>()
+        val fetchBy = typeReference
+            .annotations
+            .firstOrNull { it.fullName == FetchBy::class.qualifiedName }
+            ?: return
+        val entityType = typeReference.fastResolve()
+        if (entityType.declaration.annotation(Entity::class) == null) {
+            throw MetaException(
+                ancestorSource(ApiOperationImpl::class.java, ApiParameterImpl::class.java),
+                ancestorSource(),
+                "Illegal type because \"$entityType\" which is decorated by `@FetchBy` is not entity type"
+            )
+        }
+        val constant = fetchBy[FetchBy::value] ?: throw MetaException(
+            ancestorSource(ApiOperationImpl::class.java, ApiParameterImpl::class.java),
+            ancestorSource(),
+            "The `value` of `@FetchBy` is required"
+        )
+        val owner = fetchBy
+            .getClassArgument(FetchBy::ownerType)
+            ?.takeIf { it.fullName != "kotlin.Unit" && it.fullName != "kotlin.Nothing" }
+            ?: ancestorSource(ApiServiceImpl::class.java, TypeDefinitionImpl::class.java).let {
+                it
+                    ?.annotation(DefaultFetcherOwner::class)
+                    ?.getClassArgument(DefaultFetcherOwner::value)
+                    ?: it
+            } as KSClassDeclaration
+        val companionDeclaration = owner
+            .declarations
+            .firstOrNull { it is KSClassDeclaration && it.isCompanionObject } as KSClassDeclaration?
+            ?: throw MetaException(
+                ancestorSource(ApiOperationImpl::class.java, ApiParameterImpl::class.java),
+                ancestorSource(),
+                "Illegal `@FetcherBy`, the owner type \"" +
+                    owner.fullName +
+                    "\" does not have companion object"
+            )
+        val field = companionDeclaration
+            .getDeclaredProperties()
+            .firstOrNull { it.name == constant }
+            ?: throw MetaException(
+                ancestorSource(ApiOperationImpl::class.java, ApiParameterImpl::class.java),
+                ancestorSource(),
+                "Illegal `@FetcherBy`, the companion object of owner type \"" +
+                    owner.fullName +
+                    "\" does any field named \"" +
+                    constant +
+                    "\""
+            )
+        val fieldType = field.type.fastResolve()
+        if (fieldType.declaration.qualifiedName?.asString() != "org.babyfish.jimmer.sql.fetcher.Fetcher") {
+            throw MetaException(
+                ancestorSource(ApiOperationImpl::class.java, ApiParameterImpl::class.java),
+                ancestorSource(),
+                "Illegal `@FetcherBy`, there is static field \"" +
+                    constant +
+                    "\" in companion object \"" +
+                    companionDeclaration.qualifiedName!!.asString() +
+                    "\" but it is not \"org.babyfish.jimmer.sql.fetcher.Fetcher\""
+            )
+        }
+        val argType = fieldType.arguments[0].let {
+            if (it.variance != Variance.INVARIANT) {
+                throw MetaException(
+                    ancestorSource(ApiOperationImpl::class.java, ApiParameterImpl::class.java),
+                    ancestorSource(),
+                    "Illegal `@FetcherBy`, there is static field \"" +
+                        constant +
+                        "\" in companion object \"" +
+                        companionDeclaration.qualifiedName!!.asString() +
+                        "\" but the variance of its generic argument is not `INVARIANT` (It is *, out, or in...)"
+                )
+            }
+            it.type!!
+        }
+        val actualEntityTypeName = argType.fastResolve().toTypeName()
+        if (actualEntityTypeName.copy(nullable = false) != entityType.toTypeName().copy(nullable = false)) {
+            throw MetaException(
+                ancestorSource(ApiOperationImpl::class.java, ApiParameterImpl::class.java),
+                ancestorSource(),
+                "Illegal `@FetcherBy`, there is property \"" +
+                    constant +
+                    "\" in companion object type \"\"" +
+                    companionDeclaration.qualifiedName!!.asString() +
+                    " but it is not fetcher for \"" +
+                    entityType.declaration.qualifiedName!!.asString() +
+                    "\""
+            )
+        }
+        typeRef.fetchBy = constant
+        typeRef.fetcherOwner = owner.toTypeName()
+        typeRef.fetcherDoc = docMetadata.getDoc(field)
     }
-    
+
     private fun SchemaBuilder<KSDeclaration>.determineTypeNameAndArguments(type: KSType) {
         val typeRef = current<TypeRefImpl<KSDeclaration>>()
-        (type.declaration as? com.google.devtools.ksp.symbol.KSTypeParameter)?.let {
-            typeRef.typeName = it.parentDeclaration!!.toTypeName().typeVariable(it.simpleName.asString())
+        (type.declaration as? KSTypeParameter)?.let {
+            typeRef.typeName = it.parentDeclaration!!.toTypeName().typeVariable(type.declaration.simpleName.asString())
             return
         }
-        
         typeRef.typeName = type.realDeclaration.toTypeName()
-        
-        if (typeRef.typeName == TypeName.OBJECT) {
+        when (typeRef.typeName.toString()) {
+            "kotlin.BooleanArray" -> {
+                typeRef.typeName = TypeName.LIST
+                typeRef.addArgument(
+                    TypeRefImpl<KSDeclaration>().apply {
+                        typeName = TypeName.BOOLEAN
+                    }
+                )
+                return
+            }
+            "kotlin.CharArray" -> {
+                typeRef.typeName = TypeName.LIST
+                typeRef.addArgument(
+                    TypeRefImpl<KSDeclaration>().apply {
+                        typeName = TypeName.CHAR
+                    }
+                )
+                return
+            }
+            "kotlin.ByteArray" -> {
+                typeRef.typeName = TypeName.LIST
+                typeRef.addArgument(
+                    TypeRefImpl<KSDeclaration>().apply {
+                        typeName = TypeName.BYTE
+                    }
+                )
+                return
+            }
+            "kotlin.ShortArray" -> {
+                typeRef.typeName = TypeName.LIST
+                typeRef.addArgument(
+                    TypeRefImpl<KSDeclaration>().apply {
+                        typeName = TypeName.SHORT
+                    }
+                )
+                return
+            }
+            "kotlin.IntArray" -> {
+                typeRef.typeName = TypeName.LIST
+                typeRef.addArgument(
+                    TypeRefImpl<KSDeclaration>().apply {
+                        typeName = TypeName.INT
+                    }
+                )
+                return
+            }
+            "kotlin.LongArray" -> {
+                typeRef.typeName = TypeName.LIST
+                typeRef.addArgument(
+                    TypeRefImpl<KSDeclaration>().apply {
+                        typeName = TypeName.LONG
+                    }
+                )
+                return
+            }
+            "kotlin.FloatArray" -> {
+                typeRef.typeName = TypeName.LIST
+                typeRef.addArgument(
+                    TypeRefImpl<KSDeclaration>().apply {
+                        typeName = TypeName.FLOAT
+                    }
+                )
+                return
+            }
+            "kotlin.DoubleArray" -> {
+                typeRef.typeName = TypeName.LIST
+                typeRef.addArgument(
+                    TypeRefImpl<KSDeclaration>().apply {
+                        typeName = TypeName.DOUBLE
+                    }
+                )
+                return
+            }
+        }
+        jsonValueTypeRef(typeRef.typeName)?.let {
+            throw JsonValueTypeChangeException(it)
+        }
+        val simpleName = type.realDeclaration.simpleName.asString()
+        val jsonFlag = listOf(
+            "JsonNode",
+            "JSONObject",
+            "JsonObject",
+            "JsonElement",
+            "ObjectNode",
+            "ArrayNode",
+        ).any {
+            it.equals(simpleName, ignoreCase = true)
+        }
+        if (jsonFlag) {
+            typeRef.typeName = TypeName.OBJECT
             return
         }
-        
-        for (arg in type.arguments) {
-            when (arg.variance) {
-                Variance.STAR, Variance.CONTRAVARIANT -> { }
-                else -> typeRef { innerType ->
-                    fillType(arg.type!!)
-                    typeRef.addArgument(innerType)
+
+        if (typeRef.typeName == TypeName.OBJECT) {
+            throw UnambiguousTypeException(
+                ancestorSource(ApiOperationImpl::class.java, ApiParameterImpl::class.java),
+                ancestorSource(),
+                "Client API system does not accept unambiguous type `java.lang.Object`"
+            )
+        }
+        for (argument in type.arguments) {
+            when (argument.variance) {
+                Variance.STAR -> throw UnambiguousTypeException(
+                    ancestorSource(ApiOperationImpl::class.java, ApiParameterImpl::class.java),
+                    ancestorSource(),
+                    "Client API type system does not accept generic argument <*>"
+                )
+                Variance.CONTRAVARIANT -> throw UnambiguousTypeException(
+                    ancestorSource(ApiOperationImpl::class.java, ApiParameterImpl::class.java),
+                    ancestorSource(),
+                    "Client API type system does not accept generic argument <in...>"
+                )
+                else -> typeRef { argType ->
+                    fillType(argument.type!!)
+                    typeRef.addArgument(argType)
                 }
             }
         }
     }
-    
-    private fun SchemaBuilder<KSDeclaration>.fillDefinitionInternal(declaration: KSClassDeclaration) {
+
+    private fun SchemaBuilder<KSDeclaration>.jsonValueTypeRef(typeName: TypeName): TypeRefImpl<KSDeclaration>? {
+        val declaration = ctx.resolver.getClassDeclarationByName(typeName.toString()) ?: return null
+        val jsonValueFun = declaration
+            .getDeclaredFunctions()
+            .firstOrNull {
+                it.annotation(ctx.jacksonTypes.jsonValue.reflectionName()) !== null &&
+                    it.parameters.isEmpty() &&
+                    it.returnType?.realDeclaration?.qualifiedName?.asString().let { n ->
+                        n != "kotlin.Unit" && n != "kotlin.Nothing"
+                    }
+            } ?: return null
+        if (!jsonValueTypeNameStack.add(typeName)) {
+            throw MetaException(
+                ancestorSource(ApiOperationImpl::class.java, ApiParameterImpl::class.java),
+                ancestorSource(),
+                "Cannot resolve \"@" +
+                    ctx.jacksonTypes.jsonValue.reflectionName() +
+                    "\" because of dead recursion: " +
+                    jsonValueTypeNameStack
+            )
+        }
+        try {
+            var result: TypeRefImpl<KSDeclaration>? = null
+            typeRef {
+                fillType(jsonValueFun.returnType!!)
+                result = it
+            }
+            return result
+        } finally {
+            jsonValueTypeNameStack.remove(typeName);
+        }
+        return null
+    }
+
+    private fun SchemaBuilder<KSDeclaration>.fillDefinition(declaration: KSClassDeclaration, immutable: Boolean) {
+
         val definition = current<TypeDefinitionImpl<KSDeclaration>>()
         definition.isApiIgnore = declaration.annotation(ApiIgnore::class) !== null
         definition.doc = docMetadata.getDoc(declaration)
-        
+
         if (declaration.classKind == ClassKind.ENUM_CLASS) {
             fillEnumDefinition(declaration)
             return
         }
-        
-        val immutable = declaration.annotation(org.babyfish.jimmer.Immutable::class) !== null ||
-                declaration.annotation(Entity::class) !== null ||
-                declaration.annotation(MappedSuperclass::class) !== null ||
-                declaration.annotation(Embeddable::class) !== null
-        
-        definition.kind = if (immutable) TypeDefinition.Kind.IMMUTABLE else TypeDefinition.Kind.OBJECT
-        
+
+        definition.kind = if (immutable) {
+            TypeDefinition.Kind.IMMUTABLE
+        } else {
+            TypeDefinition.Kind.OBJECT
+        }
+
         if (!immutable || declaration.classKind == ClassKind.INTERFACE) {
+            val isClientException = declaration.annotation(ClientException::class) != null
             for (propDeclaration in declaration.getDeclaredProperties()) {
                 if (!propDeclaration.isPublic() ||
-                    propDeclaration.annotation(ApiIgnore::class) != null) {
+                    propDeclaration.annotation(ApiIgnore::class) != null ||
+                    propDeclaration.annotation(ctx.jacksonTypes.jsonIgnore.reflectionName()) != null) {
                     continue
                 }
-                
-                prop(propDeclaration, propDeclaration.name) { prop ->
-                    typeRef { type ->
-                        fillType(propDeclaration.type)
-                        prop.setType(type)
+                if (isClientException &&
+                    propDeclaration.name.let { it == "code" || it == "fields" }) {
+                    continue
+                }
+                val ksTypeReference = declaration
+                    .takeIf { immutable }
+                    ?.let {
+                        ctx.typeOf(declaration)
+                            .properties[propDeclaration.name]!!
+                            .converterMetadata
+                            ?.targetType
                     }
-                    prop.doc = docMetadata.getDoc(propDeclaration)
-                    definition.addProp(prop)
+                    ?.let {
+                        val resolver = ctx.resolver
+                        when (it.variance) {
+                            Variance.STAR -> resolver.createKSTypeReferenceFromKSType(resolver.builtIns.anyType.makeNullable())
+                            Variance.CONTRAVARIANT -> resolver.createKSTypeReferenceFromKSType(resolver.builtIns.anyType)
+                            else -> it.type
+                        }
+                    } ?: propDeclaration.type
+                prop(propDeclaration, propDeclaration.name) { prop ->
+                    try {
+                        typeRef { type ->
+                            fillType(ksTypeReference)
+                            prop.setType(type)
+                        }
+                        prop.doc = docMetadata.getDoc(propDeclaration)
+                        definition.addProp(prop)
+                    } catch (ex: UnambiguousTypeException) {
+                        // Do nothing
+                    }
                 }
             }
-            
             for (funcDeclaration in declaration.getDeclaredFunctions()) {
                 if (!funcDeclaration.isConstructor() &&
                     funcDeclaration.isPublic() &&
-                    funcDeclaration.parameters.isEmpty()) {
-                    val returnTypeReference = funcDeclaration.returnType ?: continue
-                    val returnTypeName = returnTypeReference.realDeclaration.qualifiedName?.asString() ?: continue
-                    if (returnTypeName == "kotlin.Unit" || returnTypeName == "kotlin.Nothing") continue
-                    
-                    val name = StringUtil.propName(funcDeclaration.simpleName.asString(), returnTypeName == "kotlin.Boolean") ?: continue
-                    prop(funcDeclaration, name) { prop ->
-                        typeRef { type ->
-                            fillType(returnTypeReference)
-                            prop.setType(type)
+                    funcDeclaration.parameters.isEmpty() &&
+                    funcDeclaration.annotation(ctx.jacksonTypes.jsonIgnore.reflectionName()) == null &&
+                    funcDeclaration.annotation(ApiIgnore::class) == null) {
+                    val returnTypReference = funcDeclaration.returnType ?: continue
+                    val returnTypeName = returnTypReference.realDeclaration.qualifiedName?.asString() ?: continue
+                    if (returnTypeName == "kotlin.Unit" || returnTypeName == "kotlin.Nothing") {
+                        continue
+                    }
+                    val name = StringUtil
+                        .propName(funcDeclaration.simpleName.asString(), returnTypeName == "kotlin.Boolean")
+                        ?: continue
+                    try {
+                        prop(funcDeclaration, name) { prop ->
+                            typeRef { type ->
+                                fillType(returnTypReference)
+                                prop.setType(type)
+                            }
+                            definition.addProp(prop)
                         }
-                        definition.addProp(prop)
+                    } catch (ex: UnambiguousTypeException) {
+                        // Do nothing
+                    }
+                }
+            }
+        }
+
+        if (declaration.annotation(ClientException::class) != null) {
+            val metadata = clientExceptionContext[declaration]
+            if (metadata.code !== null) {
+                definition.error = TypeDefinition.Error(
+                    metadata.family,
+                    metadata.code
+                )
+            }
+        }
+
+        if (declaration.classKind == ClassKind.CLASS || declaration.classKind == ClassKind.INTERFACE) {
+            for (superTypeReference in declaration.superTypes) {
+                val superDeclaration = superTypeReference.realDeclaration
+                if (superDeclaration.annotation(ApiIgnore::class) == null) {
+                    val superName = superDeclaration.toTypeName()
+                    if (superName.isGenerationRequired &&
+                        superName != CODE_BASED_EXCEPTION_NAME &&
+                        superName != CODE_BASED_RUNTIME_EXCEPTION_NAME) {
+                        typeRef { superType ->
+                            fillType(superTypeReference)
+                            definition.addSuperType(superType)
+                        }
                     }
                 }
             }
         }
     }
-    
+
     private fun SchemaBuilder<KSDeclaration>.fillEnumDefinition(declaration: KSClassDeclaration) {
+
         val definition = current<TypeDefinitionImpl<KSDeclaration>>()
         definition.kind = TypeDefinition.Kind.ENUM
-        
-        for (child in declaration.declarations) {
-            if (child is KSClassDeclaration && child.classKind == ClassKind.ENUM_ENTRY) {
-                constant(child, child.simpleName.asString()) {
-                    it.doc = docMetadata.getDoc(child)
+
+        for (childDeclaration in declaration.declarations) {
+            if (childDeclaration is KSClassDeclaration && childDeclaration.classKind == ClassKind.ENUM_ENTRY) {
+                constant(childDeclaration, childDeclaration.simpleName.asString()) {
+                    it.doc = docMetadata.getDoc(childDeclaration)
                     definition.addEnumConstant(it)
                 }
             }
         }
     }
-    
+
     private fun isApiService(declaration: KSClassDeclaration, explicitClientApi: Boolean): Boolean {
-        if (!ctx.include(declaration)) return false
-        if (declaration.annotation(ApiIgnore::class) !== null) return false
-        if (declaration.annotation(Api::class) !== null) return true
-        if (!explicitClientApi) return false
+        if (!ctx.include(declaration)) {
+            return false
+        }
+        if (declaration.annotation(ApiIgnore::class) !== null) {
+            return false
+        }
+        if (declaration.annotation(Api::class) !== null) {
+            return true
+        }
+        if (!explicitClientApi) {
+            return false
+        }
         return declaration.annotation("org.springframework.web.bind.annotation.RestController") !== null
     }
-    
-    private fun isApiOperation(declaration: com.google.devtools.ksp.symbol.KSFunctionDeclaration): Boolean {
-        if (!declaration.isPublic()) return false
-        if (declaration.annotation(ApiIgnore::class) !== null) return false
-        if (declaration.annotation(Api::class) !== null) return true
+
+    private fun isApiOperation(declaration: KSFunctionDeclaration, explicitClientApi: Boolean): Boolean {
+        if (!declaration.isPublic()) {
+            return false
+        }
+        if (declaration.annotation(ApiIgnore::class) !== null) {
+            return false
+        }
+        if (declaration.annotation(Api::class) !== null) {
+            return true
+        }
+        if (!explicitClientApi) {
+            return false
+        }
         return ApiOperation.AUTO_OPERATION_ANNOTATIONS.any { declaration.annotation(it) !== null }
     }
-    
-    private class JsonValueTypeChangeException(val typeRef: TypeRefImpl<KSDeclaration>) : RuntimeException()
-    
-    private fun TypeRefImpl<KSDeclaration>.removeOptional() {
-        if (typeName == TypeName.OPTIONAL) {
-            val target = arguments[0] as TypeRefImpl<KSDeclaration>
-            replaceBy(target, null)
-        }
-    }
-    
-    private fun KSDeclaration.toTypeName(): TypeName {
-        val simpleNames = mutableListOf<String>()
-        var d: KSDeclaration? = this
-        while (d is KSClassDeclaration) {
-            simpleNames += d.simpleName.asString()
-            d = d.parentDeclaration
-        }
-        simpleNames.reverse()
-        return TypeName.of(packageName.asString(), simpleNames)
-    }
-    
-    private val KSType.realDeclaration: KSDeclaration
-        get() = declaration.let {
-            if (it is KSTypeAlias) it.findActualType() else it
-        }
-    
-    private val KSTypeReference.realDeclaration: KSDeclaration
-        get() = resolve().declaration.let {
-            if (it is KSTypeAlias) it.findActualType() else it
-        }
-}
 
-private fun SchemaBuilder<*>.current(): Any? = null
-private fun SchemaBuilder<*>.api(declaration: KSClassDeclaration, typeName: TypeName, block: (ApiServiceImpl<KSDeclaration>) -> Unit): ApiServiceImpl<KSDeclaration> {
-    val service = ApiServiceImpl<KSDeclaration>(null)
-    service.typeName = typeName
-    block(service)
-    return service
-}
-private fun SchemaBuilder<*>.operation(declaration: com.google.devtools.ksp.symbol.KSFunctionDeclaration, name: String, block: (ApiOperationImpl<KSDeclaration>) -> Unit): ApiOperationImpl<KSDeclaration> {
-    val operation = ApiOperationImpl<KSDeclaration>(null)
-    operation.name = name
-    block(operation)
-    return operation
-}
-private fun SchemaBuilder<*>.parameter(source: KSDeclaration?, name: String, block: (ApiParameterImpl<KSDeclaration>) -> Unit): ApiParameterImpl<KSDeclaration> {
-    val param = ApiParameterImpl<KSDeclaration>(source)
-    param.name = name
-    block(param)
-    return param
-}
-private fun SchemaBuilder<*>.typeRef(block: TypeRefImpl<KSDeclaration>.() -> Unit): TypeRefImpl<KSDeclaration> {
-    val ref = TypeRefImpl<KSDeclaration>(null)
-    ref.block()
-    return ref
-}
-private fun SchemaBuilder<*>.prop(source: KSDeclaration, name: String, block: (org.babyfish.jimmer.client.meta.impl.TypePropImpl<KSDeclaration>) -> Unit): org.babyfish.jimmer.client.meta.impl.TypePropImpl<KSDeclaration> {
-    val prop = org.babyfish.jimmer.client.meta.impl.TypePropImpl<KSDeclaration>(source)
-    prop.name = name
-    block(prop)
-    return prop
-}
-private fun SchemaBuilder<*>.constant(source: KSDeclaration, name: String, block: (org.babyfish.jimmer.client.meta.impl.EnumConstantImpl<KSDeclaration>) -> Unit): org.babyfish.jimmer.client.meta.impl.EnumConstantImpl<KSDeclaration> {
-    val constant = org.babyfish.jimmer.client.meta.impl.EnumConstantImpl<KSDeclaration>(source)
-    constant.name = name
-    block(constant)
-    return constant
+    private class UnambiguousTypeException(
+        declaration: KSDeclaration,
+        childDeclaration: KSDeclaration?,
+        reason: String,
+        cause: Throwable? = null
+    ) : MetaException(declaration, childDeclaration, reason, cause)
+
+    private class JsonValueTypeChangeException(
+        val typeRef: TypeRefImpl<KSDeclaration>
+    ): RuntimeException()
+
+    companion object {
+
+        fun KSDeclaration.toTypeName(): TypeName {
+            val simpleNames = mutableListOf<String>()
+            var d: KSDeclaration? = this
+            while (d is KSClassDeclaration) {
+                simpleNames += d.simpleName.asString()
+                d = d.parentDeclaration
+            }
+            simpleNames.reverse()
+            return TypeName.of(packageName.asString(), simpleNames)
+        }
+
+        val KSType.realDeclaration: KSDeclaration
+            get() = declaration.let {
+                if (it is KSTypeAlias) {
+                    it.findActualType()
+                } else {
+                    it
+                }
+            }
+
+        val KSTypeReference.realDeclaration: KSDeclaration
+            get() = resolve().declaration.let {
+                if (it is KSTypeAlias) {
+                    it.findActualType()
+                } else {
+                    it
+                }
+            }
+
+        @Suppress("UNCHECKED_CAST")
+        private fun TypeRefImpl<KSDeclaration>.removeOptional() {
+            if (typeName == TypeName.OPTIONAL) {
+                val target = arguments[0] as TypeRefImpl<KSDeclaration>
+                replaceBy(target, null)
+            }
+        }
+
+        private val CODE_BASED_EXCEPTION_NAME = TypeName.of(
+            CodeBasedException::class.java
+        )
+
+        private val CODE_BASED_RUNTIME_EXCEPTION_NAME = TypeName.of(
+            CodeBasedRuntimeException::class.java
+        )
+    }
 }
