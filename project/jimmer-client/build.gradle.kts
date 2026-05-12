@@ -29,6 +29,7 @@ tasks.withType<JavaCompile>().configureEach {
 ksp {
     arg("jimmer.source.includes", "org.babyfish.jimmer.client.kotlin.")
     arg("jimmer.dto.testDirs", "src/test/dto2")
+    arg("jimmer.ksp.projectDir", project.rootProject.projectDir.absolutePath)
 }
 
 kotlin {

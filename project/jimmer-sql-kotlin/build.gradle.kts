@@ -27,6 +27,7 @@ dependencies {
 ksp {
     arg("jimmer.dto.mutable", "true")
     arg("jimmer.dto.hibernateValidatorEnhancement", "true")
+    arg("jimmer.ksp.projectDir", project.rootProject.projectDir.absolutePath)
 //    arg("jimmer.jackson3", "true")
 }
 

@@ -4,12 +4,21 @@ import com.google.devtools.ksp.processing.SymbolProcessorEnvironment
 import com.google.devtools.ksp.processing.CodeGenerator
 import com.google.devtools.ksp.processing.Dependencies
 import java.io.OutputStreamWriter
+import java.io.File
 import java.nio.charset.StandardCharsets
 
 class ProcessorState(
     private val environment: SymbolProcessorEnvironment
 ) {
     private val stateFileName = ".jimmer_ksp_state"
+
+    private val projectRootDir: File by lazy {
+        File(System.getProperty("user.dir"))
+    }
+
+    private val sharedStateDir: File by lazy {
+        File(System.getProperty("user.home"), ".jimmer-ksp-state")
+    }
     
     data class State(
         val explicitClientApi: Boolean = false,
@@ -187,14 +196,26 @@ class ProcessorState(
             environment.options["jimmer.ksp.state"]?.let {
                 return State.fromJson(it)
             }
-            val kspStateDir = File(System.getProperty("user.dir"), ".jimmer-ksp-state")
-            val stateFile = File(kspStateDir, "$stateFileName.json")
-            if (stateFile.exists()) {
-                val json = stateFile.readText(StandardCharsets.UTF_8)
-                State.fromJson(json)
-            } else {
-                null
+            environment.options["jimmer.ksp.projectDir"]?.let { projectDir ->
+                val projectStateFile = File(projectDir, "$stateFileName.json")
+                if (projectStateFile.exists()) {
+                    val json = projectStateFile.readText(StandardCharsets.UTF_8)
+                    return State.fromJson(json)
+                }
             }
+            if (sharedStateDir.exists()) {
+                val sharedStateFile = File(sharedStateDir, "$projectRootDir.absolutePath.json")
+                if (sharedStateFile.exists()) {
+                    val json = sharedStateFile.readText(StandardCharsets.UTF_8)
+                    return State.fromJson(json)
+                }
+            }
+            val localStateFile = File(projectRootDir, ".jimmer-ksp-state/$stateFileName.json")
+            if (localStateFile.exists()) {
+                val json = localStateFile.readText(StandardCharsets.UTF_8)
+                return State.fromJson(json)
+            }
+            null
         } catch (e: Exception) {
             environment.logger.warn("Failed to load processor state: ${e.message}")
             null
@@ -207,11 +228,19 @@ class ProcessorState(
     
     fun save() {
         val json = currentState.toJson()
-        val kspStateDir = File(System.getProperty("user.dir"), ".jimmer-ksp-state")
-        kspStateDir.mkdirs()
-        val stateFile = File(kspStateDir, "$stateFileName.json")
-        stateFile.writeText(json, StandardCharsets.UTF_8)
-        environment.logger.info("Processor state saved to ${stateFile.absolutePath}")
+        val useSharedDir = environment.options["jimmer.ksp.projectDir"] != null
+        if (useSharedDir) {
+            sharedStateDir.mkdirs()
+            val stateFile = File(sharedStateDir, "$projectRootDir.absolutePath.json")
+            stateFile.writeText(json, StandardCharsets.UTF_8)
+            environment.logger.info("Processor state saved to shared location: ${stateFile.absolutePath}")
+        } else {
+            val kspStateDir = File(projectRootDir, ".jimmer-ksp-state")
+            kspStateDir.mkdirs()
+            val stateFile = File(kspStateDir, "$stateFileName.json")
+            stateFile.writeText(json, StandardCharsets.UTF_8)
+            environment.logger.info("Processor state saved to ${stateFile.absolutePath}")
+        }
     }
     
     fun getState(): State = currentState

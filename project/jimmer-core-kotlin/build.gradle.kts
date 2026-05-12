@@ -27,6 +27,7 @@ kotlin {
 
 ksp {
     arg("jimmer.source.excludes", "org.babyfish.jimmer.kt.model.JavaData")
+    arg("jimmer.ksp.projectDir", project.rootProject.projectDir.absolutePath)
 }
 
 tasks.test {
