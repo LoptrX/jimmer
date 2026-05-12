@@ -91,10 +91,15 @@ class TypeResolver(private val ctx: Context) {
                 }
             }
             
-            for (dep in prop.formulaDependencies) {
-                val depDecl = ctx.resolver.getClassDeclarationByName(dep)
-                if (depDecl != null && !pendingDeclarations.contains(depDecl) && isJimmerType(depDecl)) {
-                    pendingDeclarations.add(depDecl)
+            for (formulaDep in prop.dependencies) {
+                for (depProp in formulaDep.props) {
+                    val depTypeName = depProp.declaringType.qualifiedName
+                    if (depTypeName != null && !resolvedTypes.containsKey(depTypeName)) {
+                        val depDecl = ctx.resolver.getClassDeclarationByName(depTypeName)
+                        if (depDecl != null && !pendingDeclarations.contains(depDecl) && isJimmerType(depDecl)) {
+                            pendingDeclarations.add(depDecl)
+                        }
+                    }
                 }
             }
         } catch (e: Exception) {
