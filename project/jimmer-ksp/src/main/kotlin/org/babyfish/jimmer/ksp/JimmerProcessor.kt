@@ -7,6 +7,7 @@ import com.google.devtools.ksp.symbol.KSAnnotated
 import com.google.devtools.ksp.symbol.KSClassDeclaration
 import com.google.devtools.ksp.symbol.KSFile
 import org.babyfish.jimmer.client.EnableImplicitApi
+import org.babyfish.jimmer.error.ErrorFamily
 import org.babyfish.jimmer.dto.compiler.DtoAstException
 import org.babyfish.jimmer.dto.compiler.DtoModifier
 import org.babyfish.jimmer.dto.compiler.DtoUtils
@@ -84,6 +85,11 @@ class JimmerProcessor(
     private var delayedClientTypeNames: Collection<String>? = null
 
     private var newFiles: List<KSFile> = emptyList()
+
+    private val allErrorTypes: MutableSet<String> = mutableSetOf()
+    private val allDtoTypes: MutableSet<String> = mutableSetOf()
+    private val allTxTypes: MutableSet<String> = mutableSetOf()
+    private val allTupleTypes: MutableSet<String> = mutableSetOf()
 
     override fun process(resolver: Resolver): List<KSAnnotated> {
         return try {
@@ -163,9 +169,12 @@ class JimmerProcessor(
             val immutableDeclarations = incrementalImmutableProcessor.process()
             processedDeclarations += immutableDeclarations
             
-            val errorGenerated = ErrorProcessor(ctx, checkedException).process()
+            val errorDeclarations = ErrorProcessor(ctx, checkedException).processDeclarations()
+            errorDeclarations.forEach { 
+                it.qualifiedName?.asString()?.let { name -> allErrorTypes.add(name) }
+            }
             
-            val dtoGenerated = DtoProcessor(
+            val dtoDeclarations = DtoProcessor(
                 ctx,
                 dtoMutable,
                 if (ctx.resolver.getAllFiles().toList().isNotEmpty() && isTest(ctx.resolver.getAllFiles().first().filePath)) {
@@ -174,16 +183,24 @@ class JimmerProcessor(
                     dtoDirs
                 },
                 defaultNullableInputModifier
-            ).process()
+            ).processDeclarations()
+            dtoDeclarations.forEach { allDtoTypes.add(it) }
             
-            TxProcessor(ctx).process()
+            val txDeclarations = TxProcessor(ctx).processDeclarations()
+            txDeclarations.forEach { 
+                it.qualifiedName?.asString()?.let { name -> allTxTypes.add(name) }
+            }
+            
             ExportDocProcessor(ctx).process()
             
+            processorState?.setProcessedErrorTypes(processorState!!.getProcessedErrorTypes() + allErrorTypes)
+            processorState?.setProcessedDtoTypes(processorState!!.getProcessedDtoTypes() + allDtoTypes)
+            processorState?.setProcessedTxTypes(processorState!!.getProcessedTxTypes() + allTxTypes)
             processorState?.setDtoFileHashes(dtoFileWatcher?.getCurrentHashes() ?: emptyMap())
             
             serverGenerated = true
             
-            if (processedDeclarations.isNotEmpty() || errorGenerated || dtoGenerated) {
+            if (processedDeclarations.isNotEmpty() || errorDeclarations.isNotEmpty() || dtoDeclarations.isNotEmpty()) {
                 delayedClientTypeNames = ctx.resolver.getAllFiles().flatMap { file ->
                     file.declarations.filterIsInstance<KSClassDeclaration>().map { it.fullName }
                 }.toList()
@@ -195,6 +212,16 @@ class JimmerProcessor(
         if (!tupleGenerated) {
             tupleGenerated = true
             val processedTupleDeclarations = TypedTupleProcessor(ctx, delayedTupleTypeNames).process()
+            processedTupleDeclarations.forEach { 
+                it.qualifiedName?.asString()?.let { name -> 
+                    allTupleTypes.add(name)
+                    processorState?.getProcessedTupleTypes()?.let { existing -> 
+                        if (name !in existing) {
+                            processorState?.setProcessedTupleTypes(existing + name)
+                        }
+                    }
+                }
+            }
             if (processedTupleDeclarations.isNotEmpty()) {
                 return processedTupleDeclarations
             }

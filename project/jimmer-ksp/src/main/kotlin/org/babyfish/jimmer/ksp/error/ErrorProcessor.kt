@@ -17,6 +17,12 @@ class ErrorProcessor(
         return errorTypes.isNotEmpty()
     }
 
+    fun processDeclarations(): List<KSClassDeclaration> {
+        val errorTypes = findErrorTypes()
+        generateErrorTypes(errorTypes)
+        return errorTypes
+    }
+
     private fun findErrorTypes(): List<KSClassDeclaration> =
         ctx
             .resolver

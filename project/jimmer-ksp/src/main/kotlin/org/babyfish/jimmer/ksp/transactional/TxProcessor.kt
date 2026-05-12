@@ -8,12 +8,18 @@ import org.babyfish.jimmer.ksp.annotation
 import org.babyfish.jimmer.ksp.fullName
 import org.babyfish.jimmer.ksp.util.fastResolve
 
+private const val TX = "org.babyfish.jimmer.sql.transaction.Tx"
+
 class TxProcessor(
     val ctx: Context
 ) {
     fun process() {
+        processDeclarations()
+    }
+
+    fun processDeclarations(): List<KSClassDeclaration> {
         if (ctx.isBuddyIgnoreResourceGeneration) {
-            return
+            return emptyList()
         }
         val map = mutableMapOf<String, KSClassDeclaration>()
         for (file in ctx.resolver.getNewFiles()) {
@@ -27,12 +33,13 @@ class TxProcessor(
             }
         }
         if (map.isEmpty()) {
-            return
+            return emptyList()
         }
         val allFiles = ctx.resolver.getAllFiles().toList()
         for (declaration in map.values) {
             TxGenerator(ctx.environment.codeGenerator, ctx, declaration).generate(allFiles)
         }
+        return map.values.toList()
     }
 
     private fun isTxType(declaration: KSClassDeclaration): Boolean {

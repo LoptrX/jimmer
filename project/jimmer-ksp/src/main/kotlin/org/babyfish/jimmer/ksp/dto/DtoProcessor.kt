@@ -27,6 +27,12 @@ class DtoProcessor(
         return dtoTypeMap.isNotEmpty()
     }
 
+    fun processDeclarations(): List<String> {
+        val dtoTypeMap = findDtoTypeMap()
+        generateDtoTypes(dtoTypeMap)
+        return dtoTypeMap.keys.map { it.name }
+    }
+
     private fun findDtoTypeMap(): Map<ImmutableType, MutableList<DtoType<ImmutableType, ImmutableProp>>> {
         val dtoTypeMap = mutableMapOf<ImmutableType, MutableList<DtoType<ImmutableType, ImmutableProp>>>()
         val dtoCtx = DtoContext(ctx.resolver.getAllFiles().firstOrNull(), dtoDirs)
