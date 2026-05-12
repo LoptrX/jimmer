@@ -185,7 +185,15 @@ class ProcessorState(
     private fun loadState(): State? {
         return try {
             environment.options["jimmer.ksp.state"]?.let {
-                State.fromJson(it)
+                return State.fromJson(it)
+            }
+            val kspStateDir = File(System.getProperty("user.dir"), ".jimmer-ksp-state")
+            val stateFile = File(kspStateDir, "$stateFileName.json")
+            if (stateFile.exists()) {
+                val json = stateFile.readText(StandardCharsets.UTF_8)
+                State.fromJson(json)
+            } else {
+                null
             }
         } catch (e: Exception) {
             environment.logger.warn("Failed to load processor state: ${e.message}")
@@ -198,21 +206,12 @@ class ProcessorState(
     }
     
     fun save() {
-        if (saved) return
-        saved = true
-        
         val json = currentState.toJson()
-        environment.codeGenerator.createNewFile(
-            Dependencies(false),
-            "",
-            stateFileName,
-            "json"
-        ).use { output ->
-            OutputStreamWriter(output, StandardCharsets.UTF_8).use { writer ->
-                writer.write(json)
-                writer.flush()
-            }
-        }
+        val kspStateDir = File(System.getProperty("user.dir"), ".jimmer-ksp-state")
+        kspStateDir.mkdirs()
+        val stateFile = File(kspStateDir, "$stateFileName.json")
+        stateFile.writeText(json, StandardCharsets.UTF_8)
+        environment.logger.info("Processor state saved to ${stateFile.absolutePath}")
     }
     
     fun getState(): State = currentState
