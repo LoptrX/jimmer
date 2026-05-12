@@ -9,7 +9,7 @@ import java.nio.charset.StandardCharsets
 class ProcessorState(
     private val environment: SymbolProcessorEnvironment
 ) {
-    private val stateFileName = ".jimmer_ksp_state.json"
+    private val stateFileName = ".jimmer_ksp_state"
     
     data class State(
         val explicitClientApi: Boolean = false,
