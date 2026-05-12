@@ -31,10 +31,19 @@ class TypedTupleGenerator(
         }
     }
 
-    fun generate() {
+    fun generate(affectedFiles: Set<com.google.devtools.ksp.symbol.KSFile> = emptySet()) {
         val allFiles = ctx.resolver.getAllFiles().toList()
+        val dependencies = if (affectedFiles.isEmpty()) {
+            allFiles.toTypedArray()
+        } else {
+            affectedFiles.filter { it.packageName.asString() == declaration.packageName.asString() }
+                .plus(declaration.containingFile)
+                .filterNotNull()
+                .distinct()
+                .toTypedArray()
+        }
         ctx.environment.codeGenerator.createNewFile(
-            Dependencies(false, *allFiles.toTypedArray()),
+            Dependencies(false, *dependencies),
             declaration.packageName.asString(),
             "${declaration.simpleName.asString()}Mapper"
         ).use {

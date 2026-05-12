@@ -16,7 +16,7 @@ class JimmerModuleGenerator(
     private val declarations: List<KSDeclaration>,
     private val isModuleRequired: Boolean
 ) {
-    fun generate(allFiles: List<KSFile>) {
+    fun generate(allFiles: List<KSFile>, affectedFiles: Set<KSFile> = emptySet()) {
         val list = declarations
         if (list.isEmpty()) {
             return
@@ -28,8 +28,13 @@ class JimmerModuleGenerator(
                 qualifiedNames += it.readLines()
             }
         }
+        val dependencies = if (affectedFiles.isEmpty()) {
+            allFiles.toTypedArray()
+        } else {
+            affectedFiles.toTypedArray()
+        }
         codeGenerator.createNewFile(
-            Dependencies(false, *allFiles.toTypedArray()),
+            Dependencies(false, *dependencies),
             "META-INF.jimmer",
             "entities",
             ""
@@ -48,7 +53,7 @@ class JimmerModuleGenerator(
             return
         }
         codeGenerator.createNewFile(
-            Dependencies(false, *allFiles.toTypedArray()),
+            Dependencies(false, *dependencies),
             packageName,
             JIMMER_MODULE
         ).use {

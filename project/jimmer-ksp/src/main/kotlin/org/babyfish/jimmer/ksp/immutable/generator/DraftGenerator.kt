@@ -20,7 +20,7 @@ class DraftGenerator(
     private val modelClassDeclarations: List<KSClassDeclaration>,
     private val excludedUserTypePrefixes: List<String>
 ) {
-    fun generate(allFiles: List<KSFile>) {
+    fun generate(allFiles: List<KSFile>, affectedFiles: Set<KSFile> = emptySet()) {
         val draftFileName =
             file.fileName.let {
                 var lastDotIndex = it.lastIndexOf('.')
@@ -30,8 +30,16 @@ class DraftGenerator(
                     "${it.substring(0, lastDotIndex)}$DRAFT"
                 }
             }
+        val dependencies = if (affectedFiles.isEmpty()) {
+            allFiles.toTypedArray()
+        } else {
+            affectedFiles.filter { it.packageName.asString() == file.packageName.asString() }
+                .plus(file)
+                .distinct()
+                .toTypedArray()
+        }
         codeGenerator.createNewFile(
-            Dependencies(false, *allFiles.toTypedArray()),
+            Dependencies(false, *dependencies),
             file.packageName.asString(),
             draftFileName
         ).use {

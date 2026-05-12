@@ -24,7 +24,7 @@ class PropsGenerator(
     private val file: KSFile,
     private val modelClassDeclaration: KSClassDeclaration
 ) {
-    fun generate(allFiles: List<KSFile>) {
+    fun generate(allFiles: List<KSFile>, affectedFiles: Set<KSFile> = emptySet()) {
         val outputFileName =
             file.fileName.let {
                 var lastDotIndex = it.lastIndexOf('.')
@@ -34,8 +34,16 @@ class PropsGenerator(
                     "${it.substring(0, lastDotIndex)}$PROPS"
                 }
             }
+        val dependencies = if (affectedFiles.isEmpty()) {
+            allFiles.toTypedArray()
+        } else {
+            affectedFiles.filter { it.packageName.asString() == file.packageName.asString() }
+                .plus(file)
+                .distinct()
+                .toTypedArray()
+        }
         codeGenerator.createNewFile(
-            Dependencies(false, *allFiles.toTypedArray()),
+            Dependencies(false, *dependencies),
             file.packageName.asString(),
             outputFileName
         ).use {

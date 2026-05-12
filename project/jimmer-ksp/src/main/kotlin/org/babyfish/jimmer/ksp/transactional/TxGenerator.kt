@@ -26,9 +26,18 @@ class TxGenerator(
 
     private val classTx = declaration.annotation(TX)
 
-    fun generate(allFiles: List<KSFile>) {
+    fun generate(allFiles: List<KSFile>, affectedFiles: Set<KSFile> = emptySet()) {
+        val dependencies = if (affectedFiles.isEmpty()) {
+            allFiles.toTypedArray()
+        } else {
+            affectedFiles.filter { it.packageName.asString() == declaration.packageName.asString() }
+                .plus(declaration.containingFile)
+                .filterNotNull()
+                .distinct()
+                .toTypedArray()
+        }
         codeGenerator.createNewFile(
-            Dependencies(false, *allFiles.toTypedArray()),
+            Dependencies(false, *dependencies),
             declaration.packageName.asString(),
             simpleName
         ).use {

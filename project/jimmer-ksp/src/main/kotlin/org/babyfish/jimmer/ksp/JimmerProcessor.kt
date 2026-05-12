@@ -5,6 +5,7 @@ import com.google.devtools.ksp.processing.SymbolProcessor
 import com.google.devtools.ksp.processing.SymbolProcessorEnvironment
 import com.google.devtools.ksp.symbol.KSAnnotated
 import com.google.devtools.ksp.symbol.KSClassDeclaration
+import com.google.devtools.ksp.symbol.KSFile
 import org.babyfish.jimmer.client.EnableImplicitApi
 import org.babyfish.jimmer.dto.compiler.DtoAstException
 import org.babyfish.jimmer.dto.compiler.DtoModifier
@@ -14,6 +15,12 @@ import org.babyfish.jimmer.ksp.client.ExportDocProcessor
 import org.babyfish.jimmer.ksp.dto.DtoProcessor
 import org.babyfish.jimmer.ksp.error.ErrorProcessor
 import org.babyfish.jimmer.ksp.immutable.ImmutableProcessor
+import org.babyfish.jimmer.ksp.incremental.DependencyTracker
+import org.babyfish.jimmer.ksp.incremental.DtoFileWatcher
+import org.babyfish.jimmer.ksp.incremental.IncrementalClientProcessor
+import org.babyfish.jimmer.ksp.incremental.IncrementalImmutableProcessor
+import org.babyfish.jimmer.ksp.incremental.ProcessorState
+import org.babyfish.jimmer.ksp.incremental.TypeResolver
 import org.babyfish.jimmer.ksp.transactional.TxProcessor
 import org.babyfish.jimmer.ksp.tuple.TypedTupleProcessor
 import java.util.regex.Pattern
@@ -56,6 +63,14 @@ class JimmerProcessor(
             SEPARATOR.split(it).toList()
         } ?: emptyList()
 
+    private val enableIncremental: Boolean =
+        environment.options["jimmer.ksp.incremental"]?.trim() != "false"
+
+    private var processorState: ProcessorState? = null
+    private var dependencyTracker: DependencyTracker? = null
+    private var typeResolver: TypeResolver? = null
+    private var dtoFileWatcher: DtoFileWatcher? = null
+
     private var serverGenerated = false
 
     private var explicitClientApi: Boolean? = null
@@ -68,9 +83,14 @@ class JimmerProcessor(
 
     private var delayedClientTypeNames: Collection<String>? = null
 
+    private var newFiles: List<KSFile> = emptyList()
+
     override fun process(resolver: Resolver): List<KSAnnotated> {
         return try {
             val ctx = Context(resolver, environment)
+            
+            initializeIncrementalComponents(ctx)
+            
             if (explicitClientApi === null) {
                 explicitClientApi = resolver.getAllFiles().any { file ->
                     file.declarations.any {
@@ -79,47 +99,19 @@ class JimmerProcessor(
                             it.annotation(EnableImplicitApi::class) !== null
                     }
                 }
+                processorState?.setExplicitClientApi(explicitClientApi ?: false)
             }
+            
             val processedDeclarations = mutableListOf<KSClassDeclaration>()
-            if (!serverGenerated) {
-                processedDeclarations += ImmutableProcessor(ctx, isModuleRequired, excludedUserAnnotationPrefixes).process()
-                val errorGenerated = ErrorProcessor(ctx, checkedException).process()
-                val dtoGenerated = DtoProcessor(
-                    ctx,
-                    dtoMutable,
-                    if (resolver.getAllFiles().toList().isNotEmpty() && isTest(ctx.resolver.getAllFiles().first().filePath)) {
-                        dtoTestDirs
-                    } else {
-                        dtoDirs
-                    },
-                    defaultNullableInputModifier
-                ).process()
-                TxProcessor(ctx).process()
-                ExportDocProcessor(ctx).process()
-                serverGenerated = true
-                if (processedDeclarations.isNotEmpty() || errorGenerated || dtoGenerated) {
-                    delayedClientTypeNames = resolver.getAllFiles().flatMap { file ->
-                        file.declarations.filterIsInstance<KSClassDeclaration>().map { it.fullName }
-                    }.toList()
-                    return processedDeclarations
-                }
+            
+            if (enableIncremental) {
+                processedDeclarations += processIncremental(ctx)
+            } else {
+                processedDeclarations += processStandard(ctx)
             }
-            if (!tupleGenerated) {
-                tupleGenerated = true
-                val processedTupleDeclarations = TypedTupleProcessor(ctx, delayedTupleTypeNames).process()
-                if (processedTupleDeclarations.isNotEmpty()) {
-                    return processedTupleDeclarations
-                }
-            }
-            if (tupleGenerated && !clientGenerated && !ctx.isBuddyIgnoreResourceGeneration) {
-                clientGenerated = true
-                ClientProcessor(
-                    ctx,
-                    explicitClientApi ?: error("Internal bug: explicitClientApi not resolved"),
-                    delayedClientTypeNames
-                ).process()
-                delayedClientTypeNames = null
-            }
+            
+            processorState?.save()
+            
             return processedDeclarations
         } catch (ex: MetaException) {
             environment.logger.error(ex.message!!, ex.declaration)
@@ -128,6 +120,152 @@ class JimmerProcessor(
             environment.logger.error(ex.message!!)
             emptyList()
         }
+    }
+    
+    private fun initializeIncrementalComponents(ctx: Context) {
+        if (!enableIncremental) return
+        
+        if (processorState == null) {
+            processorState = ProcessorState(environment).initialize()
+        }
+        
+        if (dependencyTracker == null) {
+            dependencyTracker = DependencyTracker(ctx)
+            dependencyTracker!!.analyze()
+        }
+        
+        if (typeResolver == null) {
+            typeResolver = TypeResolver(ctx)
+            typeResolver!!.initialize()
+        }
+        
+        if (dtoFileWatcher == null) {
+            dtoFileWatcher = DtoFileWatcher(environment, dtoDirs + dtoTestDirs)
+            dtoFileWatcher!!.initialize(processorState!!.getDtoFileHashes())
+        }
+        
+        newFiles = ctx.resolver.getNewFiles().toList()
+    }
+    
+    private fun processIncremental(ctx: Context): List<KSClassDeclaration> {
+        val processedDeclarations = mutableListOf<KSClassDeclaration>()
+        
+        if (!serverGenerated) {
+            val incrementalImmutableProcessor = IncrementalImmutableProcessor(
+                ctx,
+                processorState!!,
+                dependencyTracker!!,
+                typeResolver!!,
+                isModuleRequired,
+                excludedUserAnnotationPrefixes
+            )
+            
+            val immutableDeclarations = incrementalImmutableProcessor.process()
+            processedDeclarations += immutableDeclarations
+            
+            val errorGenerated = ErrorProcessor(ctx, checkedException).process()
+            
+            val dtoGenerated = DtoProcessor(
+                ctx,
+                dtoMutable,
+                if (ctx.resolver.getAllFiles().toList().isNotEmpty() && isTest(ctx.resolver.getAllFiles().first().filePath)) {
+                    dtoTestDirs
+                } else {
+                    dtoDirs
+                },
+                defaultNullableInputModifier
+            ).process()
+            
+            TxProcessor(ctx).process()
+            ExportDocProcessor(ctx).process()
+            
+            processorState?.setDtoFileHashes(dtoFileWatcher?.getCurrentHashes() ?: emptyMap())
+            
+            serverGenerated = true
+            
+            if (processedDeclarations.isNotEmpty() || errorGenerated || dtoGenerated) {
+                delayedClientTypeNames = ctx.resolver.getAllFiles().flatMap { file ->
+                    file.declarations.filterIsInstance<KSClassDeclaration>().map { it.fullName }
+                }.toList()
+                
+                return processedDeclarations
+            }
+        }
+        
+        if (!tupleGenerated) {
+            tupleGenerated = true
+            val processedTupleDeclarations = TypedTupleProcessor(ctx, delayedTupleTypeNames).process()
+            if (processedTupleDeclarations.isNotEmpty()) {
+                return processedTupleDeclarations
+            }
+        }
+        
+        if (tupleGenerated && !clientGenerated && !ctx.isBuddyIgnoreResourceGeneration) {
+            clientGenerated = true
+            
+            val incrementalClientProcessor = IncrementalClientProcessor(
+                ctx,
+                processorState!!
+            )
+            
+            if (incrementalClientProcessor.shouldProcess()) {
+                incrementalClientProcessor.process(
+                    explicitClientApi ?: error("Internal bug: explicitClientApi not resolved")
+                )
+            }
+            
+            delayedClientTypeNames = null
+        }
+        
+        return processedDeclarations
+    }
+    
+    private fun processStandard(ctx: Context): List<KSClassDeclaration> {
+        val processedDeclarations = mutableListOf<KSClassDeclaration>()
+        
+        if (!serverGenerated) {
+            processedDeclarations += ImmutableProcessor(ctx, isModuleRequired, excludedUserAnnotationPrefixes).process()
+            val errorGenerated = ErrorProcessor(ctx, checkedException).process()
+            val dtoGenerated = DtoProcessor(
+                ctx,
+                dtoMutable,
+                if (ctx.resolver.getAllFiles().toList().isNotEmpty() && isTest(ctx.resolver.getAllFiles().first().filePath)) {
+                    dtoTestDirs
+                } else {
+                    dtoDirs
+                },
+                defaultNullableInputModifier
+            ).process()
+            TxProcessor(ctx).process()
+            ExportDocProcessor(ctx).process()
+            serverGenerated = true
+            if (processedDeclarations.isNotEmpty() || errorGenerated || dtoGenerated) {
+                delayedClientTypeNames = ctx.resolver.getAllFiles().flatMap { file ->
+                    file.declarations.filterIsInstance<KSClassDeclaration>().map { it.fullName }
+                }.toList()
+                return processedDeclarations
+            }
+        }
+        
+        if (!tupleGenerated) {
+            tupleGenerated = true
+            val processedTupleDeclarations = TypedTupleProcessor(ctx, delayedTupleTypeNames).process()
+            if (processedTupleDeclarations.isNotEmpty()) {
+                return processedTupleDeclarations
+            }
+        }
+        
+        if (tupleGenerated && !clientGenerated && !ctx.isBuddyIgnoreResourceGeneration) {
+            clientGenerated = true
+            ClientProcessor(
+                ctx,
+                explicitClientApi ?: error("Internal bug: explicitClientApi not resolved"),
+                delayedClientTypeNames
+            ).process()
+            delayedClientTypeNames = null
+        }
+        
+        return processedDeclarations
     }
 
     private fun dtoDir(configurationName: String, prefix: String) : Collection<String>? =
