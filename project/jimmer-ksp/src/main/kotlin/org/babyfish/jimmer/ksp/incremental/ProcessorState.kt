@@ -172,6 +172,7 @@ class ProcessorState(
     
     private var currentState: State = State()
     private var initialized = false
+    private var saved = false
     
     fun initialize(): State {
         if (initialized) return currentState
@@ -197,6 +198,9 @@ class ProcessorState(
     }
     
     fun save() {
+        if (saved) return
+        saved = true
+        
         val json = currentState.toJson()
         environment.codeGenerator.createNewFile(
             Dependencies(false),
