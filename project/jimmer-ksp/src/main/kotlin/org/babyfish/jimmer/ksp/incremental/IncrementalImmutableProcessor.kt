@@ -124,6 +124,11 @@ class IncrementalImmutableProcessor(
             .filterKeys { it != null }
             .mapValues { it.value }
         
+        for (declaration in declarations) {
+            ctx.typeOf(declaration)
+        }
+        ctx.resolve()
+        
         generateJimmerTypes(modelMap)
         
         val allProcessed = state.getProcessedEntityTypes().toMutableSet()
@@ -139,6 +144,11 @@ class IncrementalImmutableProcessor(
         val modelMap = declarations.groupBy { it.containingFile ?: return@groupBy null }
             .filterKeys { it != null }
             .mapValues { it.value }
+        
+        for (declaration in declarations) {
+            ctx.typeOf(declaration)
+        }
+        ctx.resolve()
         
         generateJimmerTypes(modelMap)
         return declarations.toSet()
